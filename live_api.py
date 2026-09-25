@@ -6,6 +6,7 @@ import requests
 import streamlit as st
 
 BASE_URL = "https://v3.football.api-sports.io"
+PREMIER_LEAGUE_ID = 39
 
 
 def api_key():
@@ -40,11 +41,25 @@ def api_get(endpoint, params=None):
 
 
 def fixtures_for_date(selected_date: date):
-    return api_get("fixtures", {"date": selected_date.isoformat(), "timezone": "Europe/London"})
+    return api_get(
+        "fixtures",
+        {
+            "date": selected_date.isoformat(),
+            "league": PREMIER_LEAGUE_ID,
+            "timezone": "Europe/London",
+        },
+    )
 
 
 def live_fixtures():
-    return api_get("fixtures", {"live": "all", "timezone": "Europe/London"})
+    return api_get(
+        "fixtures",
+        {
+            "live": "all",
+            "league": PREMIER_LEAGUE_ID,
+            "timezone": "Europe/London",
+        },
+    )
 
 
 def prediction_for_fixture(fixture_id):
