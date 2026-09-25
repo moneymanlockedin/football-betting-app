@@ -1,98 +1,86 @@
 import io
-from datetime import datetime
+import re
 
 import pandas as pd
 import requests
 import streamlit as st
 
 st.set_page_config(page_title="Football Betting Research Lab", page_icon="⚽", layout="wide")
-
 st.title("⚽ Football Betting Research Lab")
-st.write("A transparent dashboard for exploring football results, team form and match statistics.")
+st.write("A transparent dashboard for exploring football results, statistics and historical odds.")
 st.info("Research only: this app does not place bets or guarantee profit. Historical patterns are not certain predictions.")
 
 CORE_COLUMNS = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
 STAT_PAIRS = {
-    "Corners": ("HC", "AC"),
-    "Shots": ("HS", "AS"),
-    "Shots on target": ("HST", "AST"),
-    "Yellow cards": ("HY", "AY"),
-    "Red cards": ("HR", "AR"),
-    "Possession %": ("HPoss", "APoss"),
-    "Fouls": ("HF", "AF"),
-    "Offsides": ("HO", "AO"),
-    "Saves": ("HSave", "ASave"),
-    "Passes": ("HPass", "APass"),
-    "Expected goals": ("HxG", "AxG"),
+    "Corners": ("HC", "AC"), "Shots": ("HS", "AS"), "Shots on target": ("HST", "AST"),
+    "Yellow cards": ("HY", "AY"), "Red cards": ("HR", "AR"), "Fouls": ("HF", "AF"),
+    "Offsides": ("HO", "AO"), "Saves": ("HSave", "ASave"), "Possession %": ("HPoss", "APoss"),
 }
-
-# Common football-data.co.uk column names are already compatible with the app.
 LEAGUES = {
-    "England Premier League": "E0",
-    "England Championship": "E1",
-    "England League One": "E2",
-    "England League Two": "E3",
-    "Scotland Premiership": "SC0",
-    "Germany Bundesliga": "D1",
-    "Spain La Liga": "SP1",
-    "Italy Serie A": "I1",
-    "France Ligue 1": "F1",
-    "Netherlands Eredivisie": "N1",
+    "England Premier League": "E0", "England Championship": "E1", "England League One": "E2",
+    "England League Two": "E3", "Scotland Premiership": "SC0", "Germany Bundesliga": "D1",
+    "Spain La Liga": "SP1", "Italy Serie A": "I1", "France Ligue 1": "F1", "Netherlands Eredivisie": "N1",
 }
+SEASONS = ["2026/27", "2025/26", "2024/25", "2023/24", "2022/23", "2021/22", "2020/21", "2019/20", "2018/19", "2017/18"]
+
+
+def season_code(season):
+    start, end = season.split("/")
+    return start[-2:] + end[-2:]
+
+
+def download_season(league_code, season):
+    url = f"https://www.football-data.co.uk/mmz4281/{season_code(season)}/{league_code}.csv"
+    response = requests.get(url, timeout=30, headers={"User-Agent": "FootballResearchLab/1.0"})
+    response.raise_for_status()
+    if len(response.content) < 100:
+        raise ValueError("The source returned an unexpectedly small file.")
+    return pd.read_csv(io.BytesIO(response.content)), url
+
 
 st.header("1. Get historical match data")
-source = st.radio("Data source", ["Upload CSV", "Import football-data.co.uk CSV"], horizontal=True)
-
-sample_csv = "Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR,HC,AC,HS,AS,HST,AST,HY,AY,HR,AR,HPoss,APoss,HF,AF\n2025-08-16,Arsenal,Leeds,2,0,H,7,3,15,7,6,2,1,2,0,0,58,42,9,12\n2025-08-17,Chelsea,Fulham,1,1,D,5,4,12,10,4,4,2,3,0,0,54,46,11,10\n2025-08-18,Liverpool,Newcastle,3,1,H,8,2,18,8,8,3,1,1,0,0,61,39,7,14\n"
-
-raw_bytes = None
+source = st.radio("Data source", ["Upload CSV", "Import multiple seasons"], horizontal=True)
+frames = []
 source_name = "Uploaded CSV"
 
 if source == "Upload CSV":
-    st.download_button("Download example CSV template", sample_csv, "football_results_template.csv", "text/csv")
-    uploaded_file = st.file_uploader("Choose a CSV file", type=["csv"])
-    if uploaded_file is not None:
-        raw_bytes = uploaded_file.getvalue()
+    template = "Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR,HC,AC,HS,AS,HST,AST,HY,AY,HR,AR,HF,AF\n2025-08-16,Arsenal,Leeds,2,0,H,7,3,15,7,6,2,1,2,0,0,9,12\n"
+    st.download_button("Download CSV template", template, "football_results_template.csv", "text/csv")
+    uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+    if uploaded is not None:
+        frames = [pd.read_csv(uploaded)]
 else:
-    col1, col2 = st.columns(2)
-    with col1:
-        league_name = st.selectbox("League", list(LEAGUES.keys()))
-    with col2:
-        season = st.selectbox("Season", ["2026/27", "2025/26", "2024/25", "2023/24", "2022/23", "2021/22", "2020/21", "2019/20"])
-    season_code = season.replace("20", "", 1).replace("/", "")
-    # football-data.co.uk uses two-digit season codes, e.g. 2526 for 2025/26.
-    season_code = season.split("/")[0][-2:] + season.split("/")[1][-2:]
-    league_code = LEAGUES[league_name]
-    data_url = f"https://www.football-data.co.uk/mmz4281/{season_code}/{league_code}.csv"
-    st.caption(f"Source URL: {data_url}")
-    if st.button("Import selected season"):
-        try:
-            response = requests.get(data_url, timeout=20, headers={"User-Agent": "FootballResearchLab/1.0"})
-            response.raise_for_status()
-            if len(response.content) < 100:
-                st.error("The source returned an unexpectedly small file. Try another season or league.")
-            else:
-                raw_bytes = response.content
-                source_name = f"football-data.co.uk — {league_name} {season}"
-                st.session_state["imported_data"] = raw_bytes
-                st.session_state["imported_source"] = source_name
-                st.success("Historical CSV downloaded. Processing it below.")
-        except requests.RequestException as error:
-            st.error(f"Could not download that dataset: {error}")
-    raw_bytes = st.session_state.get("imported_data", raw_bytes)
-    source_name = st.session_state.get("imported_source", source_name)
+    left, right = st.columns(2)
+    with left:
+        league_name = st.selectbox("League", list(LEAGUES.keys()), index=0)
+    with right:
+        chosen_seasons = st.multiselect("Seasons to combine", SEASONS, default=["2025/26", "2024/25", "2023/24"])
+    if st.button("Import selected seasons", type="primary"):
+        progress = st.progress(0)
+        errors = []
+        for index, season in enumerate(chosen_seasons):
+            try:
+                frame, url = download_season(LEAGUES[league_name], season)
+                frame["ImportedSeason"] = season
+                frames.append(frame)
+            except Exception as error:
+                errors.append(f"{season}: {error}")
+            progress.progress((index + 1) / max(len(chosen_seasons), 1))
+        if errors:
+            for error in errors:
+                st.warning(error)
+        if frames:
+            st.session_state["multi_season_frames"] = frames
+            st.session_state["multi_season_source"] = f"{league_name} — {', '.join(chosen_seasons)}"
+            st.success(f"Downloaded {len(frames)} season file(s).")
+    frames = st.session_state.get("multi_season_frames", frames)
+    source_name = st.session_state.get("multi_season_source", source_name)
 
-if raw_bytes is None:
-    st.warning("Choose a CSV upload or import a league and season to begin.")
+if not frames:
+    st.warning("Upload a CSV or import one or more seasons to begin.")
     st.stop()
 
-try:
-    matches = pd.read_csv(io.BytesIO(raw_bytes))
-except Exception as error:
-    st.error(f"The CSV could not be read: {error}")
-    st.stop()
-
-# Normalise common provider naming differences.
+matches = pd.concat(frames, ignore_index=True, sort=False)
 rename_map = {
     "Home Team": "HomeTeam", "Away Team": "AwayTeam", "HomeGoals": "FTHG", "AwayGoals": "FTAG",
     "FullTimeHomeGoals": "FTHG", "FullTimeAwayGoals": "FTAG", "FullTimeResult": "FTR",
@@ -104,25 +92,20 @@ if missing:
     st.write("Columns found:", ", ".join(map(str, matches.columns)))
     st.stop()
 
-available_stats = {label: pair for label, pair in STAT_PAIRS.items() if all(column in matches.columns for column in pair)}
-keep_columns = CORE_COLUMNS + [column for pair in available_stats.values() for column in pair]
-matches = matches[keep_columns].copy()
 matches["Date"] = pd.to_datetime(matches["Date"], errors="coerce", dayfirst=True)
-for column in ["FTHG", "FTAG"] + [column for pair in available_stats.values() for column in pair]:
-    matches[column] = pd.to_numeric(matches[column], errors="coerce")
 matches["FTR"] = matches["FTR"].astype(str).str.upper().str.strip()
+for column in ["FTHG", "FTAG"]:
+    matches[column] = pd.to_numeric(matches[column], errors="coerce")
+for label, pair in STAT_PAIRS.items():
+    for column in pair:
+        if column in matches.columns:
+            matches[column] = pd.to_numeric(matches[column], errors="coerce")
 
 errors = []
 if matches["Date"].isna().any(): errors.append("Some dates are invalid.")
 if matches[["FTHG", "FTAG"]].isna().any().any(): errors.append("Some goal values are missing or invalid.")
 if (matches[["FTHG", "FTAG"]] < 0).any().any(): errors.append("Goals cannot be negative.")
 if not matches["FTR"].isin(["H", "D", "A"]).all(): errors.append("FTR must be H, D or A.")
-if matches["HomeTeam"].astype(str).str.strip().eq("").any() or matches["AwayTeam"].astype(str).str.strip().eq("").any(): errors.append("Team names cannot be blank.")
-for label, (home_col, away_col) in available_stats.items():
-    if matches[[home_col, away_col]].isna().any().any(): errors.append(f"Some {label.lower()} values are missing or invalid.")
-    if label == "Possession %":
-        if ((matches[[home_col, away_col]] < 0) | (matches[[home_col, away_col]] > 100)).any().any(): errors.append("Possession must be between 0 and 100.")
-    elif (matches[[home_col, away_col]] < 0).any().any(): errors.append(f"{label} cannot contain negative values.")
 if errors:
     st.error("Validation issues found:")
     for error in errors: st.write(f"- {error}")
@@ -135,22 +118,29 @@ matches["TotalGoals"] = matches["FTHG"] + matches["FTAG"]
 matches["BTTS"] = (matches["FTHG"] > 0) & (matches["FTAG"] > 0)
 matches = matches.sort_values("Date").reset_index(drop=True)
 
+available_stats = {label: pair for label, pair in STAT_PAIRS.items() if all(column in matches.columns for column in pair)}
+odds_columns = [column for column in matches.columns if re.search(r"(^B365|^BW|^IW|^PS|^WH|^VC|^Max|^Avg|_C$|Odds|odds)", str(column))]
+
 st.success(f"Validation passed: {len(matches):,} matches loaded from {source_name}.")
 
 st.header("2. Dataset overview")
-metrics = st.columns(5)
+metrics = st.columns(6)
 metrics[0].metric("Matches", f"{len(matches):,}")
 metrics[1].metric("Teams", f"{pd.unique(matches[['HomeTeam', 'AwayTeam']].values.ravel()).size:,}")
 metrics[2].metric("Average goals", f"{matches['TotalGoals'].mean():.2f}")
-metrics[3].metric("Both teams scored", f"{matches['BTTS'].mean() * 100:.1f}%")
-metrics[4].metric("Optional stat groups", len(available_stats))
+metrics[3].metric("BTTS", f"{matches['BTTS'].mean() * 100:.1f}%")
+metrics[4].metric("Stat groups", len(available_stats))
+metrics[5].metric("Odds columns", len(odds_columns))
 if available_stats:
     st.success("Statistics detected: " + ", ".join(available_stats.keys()))
+if odds_columns:
+    st.success(f"Historical odds detected: {len(odds_columns)} columns. These can support price-aware backtesting.")
 else:
-    st.warning("No optional statistics were detected in this dataset.")
+    st.warning("No odds columns detected. Profitability cannot be tested without historical prices.")
 
+st.download_button("Download combined dataset", matches.to_csv(index=False), "combined_football_dataset.csv", "text/csv")
 st.subheader("Recent matches")
-st.dataframe(matches.sort_values("Date", ascending=False).head(50), use_container_width=True, hide_index=True)
+st.dataframe(matches.sort_values("Date", ascending=False).head(100), use_container_width=True, hide_index=True)
 
 st.header("3. Result breakdown")
 counts = matches["FTR"].value_counts().reindex(["H", "D", "A"], fill_value=0)
@@ -175,8 +165,7 @@ team_metrics[1].metric("Wins", wins)
 team_metrics[2].metric("Draws", draws)
 team_metrics[3].metric("Losses", losses)
 if len(team_matches):
-    points = wins * 3 + draws
-    st.write(f"**{selected_team}:** {points} points · {int(team_matches['TeamGoalsFor'].sum())} scored · {int(team_matches['TeamGoalsAgainst'].sum())} conceded · {team_matches['TeamGoalsFor'].mean():.2f} goals per game.")
+    st.write(f"**{selected_team}:** {wins * 3 + draws} points · {int(team_matches['TeamGoalsFor'].sum())} scored · {int(team_matches['TeamGoalsAgainst'].sum())} conceded · {team_matches['TeamGoalsFor'].mean():.2f} goals per game.")
 
 st.subheader("Last five matches")
 last_five = team_matches.head(5).copy()
@@ -188,9 +177,9 @@ if available_stats and len(team_matches):
     rows = []
     for label, (home_col, away_col) in available_stats.items():
         values = [row[home_col] if row["HomeTeam"] == selected_team else row[away_col] for _, row in team_matches.iterrows()]
-        rows.append({"Statistic": label, "Team average per match": round(pd.Series(values).mean(), 2)})
+        rows.append({"Statistic": label, "Team average per match": round(pd.Series(values).dropna().mean(), 2)})
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 else:
     st.info("Upload a dataset containing optional statistics to see team-level averages.")
 
-st.caption("Next: pre-match features, odds ingestion and time-ordered backtesting. No future information is used in the current summaries.")
+st.caption("Next: market-specific odds mapping and time-ordered backtesting. No future information is used in the current summaries.")
