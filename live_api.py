@@ -7,6 +7,7 @@ import streamlit as st
 
 BASE_URL = "https://v3.football.api-sports.io"
 PREMIER_LEAGUE_ID = 39
+PREMIER_LEAGUE_NAME = "Premier League"
 
 
 def api_key():
@@ -40,26 +41,43 @@ def api_get(endpoint, params=None):
         return None, "The API returned an invalid JSON response."
 
 
+def season_for_date(selected_date: date) -> int:
+    """Premier League seasons start in August, so January-July belongs to the prior year."""
+    return selected_date.year if selected_date.month >= 8 else selected_date.year - 1
+
+
+def _is_premier_league(item) -> bool:
+    league = item.get("league") or {}
+    return league.get("id") == PREMIER_LEAGUE_ID or str(league.get("name", "")).strip().lower() == PREMIER_LEAGUE_NAME.lower()
+
+
+def _filter_premier_league(items):
+    return [item for item in (items or []) if _is_premier_league(item)]
+
+
 def fixtures_for_date(selected_date: date):
-    return api_get(
+    payload, error = api_get(
         "fixtures",
         {
             "date": selected_date.isoformat(),
             "league": PREMIER_LEAGUE_ID,
+            "season": season_for_date(selected_date),
             "timezone": "Europe/London",
         },
     )
+    return _filter_premier_league(payload), error
 
 
 def live_fixtures():
-    return api_get(
+    # API-Football supports league-scoped live queries through live=39.
+    payload, error = api_get(
         "fixtures",
         {
-            "live": "all",
-            "league": PREMIER_LEAGUE_ID,
+            "live": str(PREMIER_LEAGUE_ID),
             "timezone": "Europe/London",
         },
     )
+    return _filter_premier_league(payload), error
 
 
 def prediction_for_fixture(fixture_id):
