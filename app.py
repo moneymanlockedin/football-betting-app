@@ -1,4 +1,5 @@
 import io
+import math
 import re
 
 import pandas as pd
@@ -12,9 +13,15 @@ st.info("Research only: this app does not place bets or guarantee profit. Histor
 
 CORE_COLUMNS = ["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
 STAT_PAIRS = {
-    "Corners": ("HC", "AC"), "Shots": ("HS", "AS"), "Shots on target": ("HST", "AST"),
-    "Yellow cards": ("HY", "AY"), "Red cards": ("HR", "AR"), "Fouls": ("HF", "AF"),
-    "Offsides": ("HO", "AO"), "Saves": ("HSave", "ASave"), "Possession %": ("HPoss", "APoss"),
+    "Corners": ("HC", "AC"),
+    "Shots": ("HS", "AS"),
+    "Shots on target": ("HST", "AST"),
+    "Yellow cards": ("HY", "AY"),
+    "Red cards": ("HR", "AR"),
+    "Fouls": ("HF", "AF"),
+    "Offsides": ("HO", "AO"),
+    "Saves": ("HSave", "ASave"),
+    "Possession %": ("HPoss", "APoss"),
 }
 LEAGUES = {
     "England Premier League": "E0", "England Championship": "E1", "England League One": "E2",
@@ -76,6 +83,99 @@ def show_summary(summary):
     cols[4].metric("ROI", f"{summary['ROI']:+.2f}%")
     cols[5].metric("Break-even", f"{summary['Break-even rate']:.1f}%")
     cols[6].metric("Max drawdown", f"{summary['Max drawdown']:.2f} units")
+
+
+def poisson_over_25(expected_goals):
+    expected_goals = max(float(expected_goals), 0.05)
+    under_or_equal_two = math.exp(-expected_goals) * (1 + expected_goals + (expected_goals ** 2) / 2)
+    return max(0.0, min(1.0, 1 - under_or_equal_two))
+
+
+def build_pre_match_features(frame):
+    """Build features using only matches before each fixture; no future results are used."""
+    ordered = frame.sort_values(["Date", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
+    histories = {}
+    prior_total_goals = []
+    rows = []
+
+    def team_summary(team):
+        history = histories.get(team, [])
+        if not history:
+            return {"games": 0, "for": None, "against": None}
+        return {
+            "games": len(history),
+            "for": sum(item[0] for item in history) / len(history),
+            "against": sum(item[1] for item in history) / len(history),
+        }
+
+    for _, match in ordered.iterrows():
+        home = team_summary(match["HomeTeam"])
+        away = team_summary(match["AwayTeam"])
+        components = [home["for"], home["against"], away["for"], away["against"]]
+        usable = [value for value in components if value is not None]
+        if len(usable) >= 2:
+            expected_home = sum(value for value in [home["for"], away["against"]] if value is not None) / len([value for value in [home["for"], away["against"]] if value is not None])
+            expected_away = sum(value for value in [away["for"], home["against"]] if value is not None) / len([value for value in [away["for"], home["against"]] if value is not None])
+            expected_total = max(0.05, expected_home + expected_away)
+            model_probability = poisson_over_25(expected_total)
+        else:
+            expected_home = None
+            expected_away = None
+            expected_total = None
+            model_probability = None
+
+        rows.append({
+            "Date": match["Date"],
+            "HomeTeam": match["HomeTeam"],
+            "AwayTeam": match["AwayTeam"],
+            "PreMatchHomeGames": home["games"],
+            "PreMatchAwayGames": away["games"],
+            "ExpectedHomeGoals": expected_home,
+            "ExpectedAwayGoals": expected_away,
+            "ExpectedTotalGoals": expected_total,
+            "ModelOver25Probability": model_probability,
+        })
+
+        histories.setdefault(match["HomeTeam"], []).append((float(match["FTHG"]), float(match["FTAG"])))
+        histories.setdefault(match["AwayTeam"], []).append((float(match["FTAG"]), float(match["FTHG"])))
+        prior_total_goals.append(float(match["FTHG"]) + float(match["FTAG"]))
+
+    features = pd.DataFrame(rows)
+    return ordered.merge(features, on=["Date", "HomeTeam", "AwayTeam"], how="left")
+
+
+def walk_forward_over25(frame, odds_column, minimum_games, minimum_edge, minimum_odds, maximum_odds, start_date, end_date):
+    features = build_pre_match_features(frame)
+    features[odds_column] = numeric(features[odds_column])
+    features["ImpliedProbability"] = 1 / features[odds_column]
+    features["Edge"] = features["ModelOver25Probability"] - features["ImpliedProbability"]
+    eligible = features[
+        (features["Date"] >= pd.Timestamp(start_date))
+        & (features["Date"] <= pd.Timestamp(end_date))
+        & (features["PreMatchHomeGames"] >= minimum_games)
+        & (features["PreMatchAwayGames"] >= minimum_games)
+        & features["ModelOver25Probability"].notna()
+        & features[odds_column].notna()
+        & (features[odds_column] >= minimum_odds)
+        & (features[odds_column] <= maximum_odds)
+        & (features["Edge"] >= minimum_edge)
+    ].copy()
+    if eligible.empty:
+        return None, eligible
+    eligible["Won"] = (eligible["FTHG"] + eligible["FTAG"]) > 2
+    eligible["Profit"] = eligible[odds_column].where(eligible["Won"], 0) - 1
+    eligible["CumulativeProfit"] = eligible["Profit"].cumsum()
+    summary = {
+        "Bets": int(len(eligible)),
+        "Wins": int(eligible["Won"].sum()),
+        "Strike rate": float(eligible["Won"].mean() * 100),
+        "Profit": float(eligible["Profit"].sum()),
+        "ROI": float(eligible["Profit"].sum() / len(eligible) * 100),
+        "Average odds": float(eligible[odds_column].mean()),
+        "Average edge": float(eligible["Edge"].mean() * 100),
+        "Max drawdown": float((eligible["CumulativeProfit"].cummax() - eligible["CumulativeProfit"]).max()),
+    }
+    return summary, eligible
 
 
 st.header("1. Get historical match data")
@@ -148,7 +248,7 @@ matches["FTHG"] = matches["FTHG"].astype(int)
 matches["FTAG"] = matches["FTAG"].astype(int)
 matches["TotalGoals"] = matches["FTHG"] + matches["FTAG"]
 matches["BTTS"] = (matches["FTHG"] > 0) & (matches["FTAG"] > 0)
-matches = matches.sort_values("Date").reset_index(drop=True)
+matches = matches.sort_values(["Date", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
 
 available_stats = {label: pair for label, pair in STAT_PAIRS.items() if all(column in matches.columns for column in pair)}
 odds_columns = [column for column in matches.columns if re.search(r"(^B365|^BW|^IW|^PS|^WH|^VC|^Max|^Avg|Odds|odds)", str(column))]
@@ -169,7 +269,6 @@ if odds_columns:
 else:
     st.warning("No odds columns detected. Profitability cannot be tested without historical prices.")
 st.download_button("Download combined dataset", matches.to_csv(index=False), "combined_football_dataset.csv", "text/csv")
-
 st.subheader("Recent matches")
 st.dataframe(matches.sort_values("Date", ascending=False).head(100), use_container_width=True, hide_index=True)
 
@@ -188,7 +287,6 @@ with settings_mid:
     end_date = st.date_input("End date", max_date, min_value=min_date, max_value=max_date)
 with settings_right:
     max_odds = st.number_input("Maximum odds", min_value=1.01, max_value=20.0, value=10.0, step=0.25)
-
 if start_date > end_date:
     st.error("Start date must be before end date.")
     st.stop()
@@ -236,25 +334,19 @@ with totals_tab:
         st.warning("No compatible over/under 2.5 odds columns were found in this dataset.")
 
 with comparison_tab:
-    st.write("Compare several minimum-odds thresholds over the same date range. This helps reveal whether a result depends on one hand-picked cutoff.")
+    st.write("Compare several minimum-odds thresholds over the same date range. This is descriptive, not a guarantee of future performance.")
     comparison_market = st.selectbox("Comparison market", ["Over 2.5 goals", "Under 2.5 goals", "Home win", "Draw", "Away win"])
     if comparison_market == "Over 2.5 goals":
-        comparison_columns = over_options
-        comparison_outcome = "TotalOutcome"
-        comparison_value = True
+        comparison_columns, comparison_outcome, comparison_value = over_options, "TotalOutcome", True
         comparison_frame = matches.copy()
         comparison_frame["TotalOutcome"] = comparison_frame["TotalGoals"] > 2.5
     elif comparison_market == "Under 2.5 goals":
-        comparison_columns = under_options
-        comparison_outcome = "TotalOutcome"
-        comparison_value = True
+        comparison_columns, comparison_outcome, comparison_value = under_options, "TotalOutcome", True
         comparison_frame = matches.copy()
         comparison_frame["TotalOutcome"] = comparison_frame["TotalGoals"] < 2.5
     else:
         comparison_columns = {"Home win": one_x_two_options, "Draw": draw_options, "Away win": away_options}[comparison_market]
-        comparison_outcome = "FTR"
-        comparison_value = {"Home win": "H", "Draw": "D", "Away win": "A"}[comparison_market]
-        comparison_frame = matches
+        comparison_outcome, comparison_value, comparison_frame = "FTR", {"Home win": "H", "Draw": "D", "Away win": "A"}[comparison_market], matches
     if comparison_columns:
         comparison_column = st.selectbox("Comparison odds source", comparison_columns)
         rows = []
@@ -305,4 +397,34 @@ if available_stats and len(team_matches):
 else:
     st.info("Upload a dataset containing optional statistics to see team-level averages.")
 
-st.caption("Next: pre-match team-strength features and walk-forward model evaluation. No future information is used in the current summaries.")
+st.header("6. Walk-forward research")
+st.write("This section creates pre-match team-strength features using only earlier matches, then evaluates a simple Over 2.5 model on later fixtures. It is deliberately transparent and should not be treated as a proven betting edge.")
+if over_options:
+    wf_left, wf_mid, wf_right = st.columns(3)
+    with wf_left:
+        wf_odds_column = st.selectbox("Walk-forward odds source", over_options)
+    with wf_mid:
+        wf_min_games = st.number_input("Minimum prior games per team", min_value=1, max_value=20, value=5, step=1)
+    with wf_right:
+        wf_min_edge = st.slider("Minimum model edge", 0.00, 0.20, 0.05, 0.01, format="%.2f")
+    wf_min_odds = st.number_input("Walk-forward minimum odds", min_value=1.01, max_value=10.0, value=1.50, step=0.05)
+    if st.button("Run walk-forward evaluation", type="primary"):
+        with st.spinner("Building strictly pre-match features and evaluating the test..."):
+            wf_summary, wf_results = walk_forward_over25(matches, wf_odds_column, int(wf_min_games), float(wf_min_edge), float(wf_min_odds), float(max_odds), start_date, end_date)
+        if wf_summary:
+            wf_cols = st.columns(7)
+            wf_cols[0].metric("Bets", wf_summary["Bets"])
+            wf_cols[1].metric("Wins", wf_summary["Wins"])
+            wf_cols[2].metric("Strike rate", f"{wf_summary['Strike rate']:.1f}%")
+            wf_cols[3].metric("Profit", f"{wf_summary['Profit']:+.2f} units")
+            wf_cols[4].metric("ROI", f"{wf_summary['ROI']:+.2f}%")
+            wf_cols[5].metric("Avg edge", f"{wf_summary['Average edge']:.2f}%")
+            wf_cols[6].metric("Max drawdown", f"{wf_summary['Max drawdown']:.2f}")
+            st.line_chart(wf_results.set_index("Date")["CumulativeProfit"])
+            st.dataframe(wf_results[["Date", "HomeTeam", "AwayTeam", "ExpectedTotalGoals", "ModelOver25Probability", "ImpliedProbability", "Edge", wf_odds_column, "Won", "Profit", "CumulativeProfit"]].head(200), use_container_width=True, hide_index=True)
+        else:
+            st.warning("No qualifying walk-forward selections were found. Try a lower edge or minimum-games requirement.")
+else:
+    st.warning("No Over 2.5 odds columns are available for walk-forward evaluation.")
+
+st.caption("Research safeguards: historical results are descriptive; model features are calculated chronologically; positive backtest results do not establish future profitability.")
