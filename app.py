@@ -35,22 +35,25 @@ def download_season(league_code, season):
     response.raise_for_status()
     if len(response.content) < 100:
         raise ValueError("The source returned an unexpectedly small file.")
-    return pd.read_csv(io.BytesIO(response.content)), url
+    return pd.read_csv(io.BytesIO(response.content))
 
 
-def clean_odds(value):
+def numeric(value):
     return pd.to_numeric(value, errors="coerce")
 
 
-def run_flat_stake_backtest(frame, odds_column, outcome_column, winning_value, minimum_odds):
-    data = frame[["Date", "HomeTeam", "AwayTeam", odds_column, outcome_column]].copy()
-    data[odds_column] = clean_odds(data[odds_column])
-    data = data.dropna(subset=[odds_column, outcome_column])
-    data = data[data[odds_column] >= minimum_odds].copy()
+def backtest(frame, odds_column, outcome_column, winning_value, minimum_odds, maximum_odds, start_date, end_date):
+    columns = ["Date", "HomeTeam", "AwayTeam", odds_column, outcome_column]
+    data = frame[columns].copy()
+    data[odds_column] = numeric(data[odds_column])
+    data = data.dropna(subset=["Date", odds_column, outcome_column])
+    data = data[(data["Date"] >= pd.Timestamp(start_date)) & (data["Date"] <= pd.Timestamp(end_date))]
+    data = data[(data[odds_column] >= minimum_odds) & (data[odds_column] <= maximum_odds)].copy()
     if data.empty:
         return None, data
     data["Won"] = data[outcome_column] == winning_value
     data["Profit"] = data[odds_column].where(data["Won"], 0) - 1
+    data["CumulativeProfit"] = data["Profit"].cumsum()
     summary = {
         "Bets": int(len(data)),
         "Wins": int(data["Won"].sum()),
@@ -58,8 +61,21 @@ def run_flat_stake_backtest(frame, odds_column, outcome_column, winning_value, m
         "Profit": float(data["Profit"].sum()),
         "ROI": float(data["Profit"].sum() / len(data) * 100),
         "Average odds": float(data[odds_column].mean()),
+        "Break-even rate": float((1 / data[odds_column].mean()) * 100),
+        "Max drawdown": float((data["CumulativeProfit"].cummax() - data["CumulativeProfit"]).max()),
     }
     return summary, data
+
+
+def show_summary(summary):
+    cols = st.columns(7)
+    cols[0].metric("Bets", summary["Bets"])
+    cols[1].metric("Wins", summary["Wins"])
+    cols[2].metric("Strike rate", f"{summary['Strike rate']:.1f}%")
+    cols[3].metric("Profit", f"{summary['Profit']:+.2f} units")
+    cols[4].metric("ROI", f"{summary['ROI']:+.2f}%")
+    cols[5].metric("Break-even", f"{summary['Break-even rate']:.1f}%")
+    cols[6].metric("Max drawdown", f"{summary['Max drawdown']:.2f} units")
 
 
 st.header("1. Get historical match data")
@@ -84,7 +100,7 @@ else:
         errors = []
         for index, season in enumerate(chosen_seasons):
             try:
-                frame, _ = download_season(LEAGUES[league_name], season)
+                frame = download_season(LEAGUES[league_name], season)
                 frame["ImportedSeason"] = season
                 frames.append(frame)
             except Exception as error:
@@ -118,24 +134,16 @@ if missing:
 matches["Date"] = pd.to_datetime(matches["Date"], errors="coerce", dayfirst=True)
 matches["FTR"] = matches["FTR"].astype(str).str.upper().str.strip()
 for column in ["FTHG", "FTAG"]:
-    matches[column] = pd.to_numeric(matches[column], errors="coerce")
+    matches[column] = numeric(matches[column])
 for pair in STAT_PAIRS.values():
     for column in pair:
         if column in matches.columns:
-            matches[column] = pd.to_numeric(matches[column], errors="coerce")
-
-errors = []
-if matches["Date"].isna().any(): errors.append("Some dates are invalid.")
-if matches[["FTHG", "FTAG"]].isna().any().any(): errors.append("Some goal values are missing or invalid.")
-if (matches[["FTHG", "FTAG"]] < 0).any().any(): errors.append("Goals cannot be negative.")
-if not matches["FTR"].isin(["H", "D", "A"]).all(): errors.append("FTR must be H, D or A.")
-if errors:
-    st.error("Validation issues found:")
-    for error in errors:
-        st.write(f"- {error}")
-    st.stop()
+            matches[column] = numeric(matches[column])
 
 matches = matches.dropna(subset=["Date", "FTHG", "FTAG"]).copy()
+if not matches["FTR"].isin(["H", "D", "A"]).all():
+    st.error("Some result values are not H, D or A. Check the uploaded data.")
+    st.stop()
 matches["FTHG"] = matches["FTHG"].astype(int)
 matches["FTAG"] = matches["FTAG"].astype(int)
 matches["TotalGoals"] = matches["FTHG"] + matches["FTAG"]
@@ -146,7 +154,6 @@ available_stats = {label: pair for label, pair in STAT_PAIRS.items() if all(colu
 odds_columns = [column for column in matches.columns if re.search(r"(^B365|^BW|^IW|^PS|^WH|^VC|^Max|^Avg|Odds|odds)", str(column))]
 
 st.success(f"Validation passed: {len(matches):,} matches loaded from {source_name}.")
-
 st.header("2. Dataset overview")
 metrics = st.columns(6)
 metrics[0].metric("Matches", f"{len(matches):,}")
@@ -161,8 +168,8 @@ if odds_columns:
     st.success(f"Historical odds detected: {len(odds_columns)} columns.")
 else:
     st.warning("No odds columns detected. Profitability cannot be tested without historical prices.")
-
 st.download_button("Download combined dataset", matches.to_csv(index=False), "combined_football_dataset.csv", "text/csv")
+
 st.subheader("Recent matches")
 st.dataframe(matches.sort_values("Date", ascending=False).head(100), use_container_width=True, hide_index=True)
 
@@ -171,7 +178,20 @@ counts = matches["FTR"].value_counts().reindex(["H", "D", "A"], fill_value=0)
 st.dataframe(pd.DataFrame({"Result": ["Home wins", "Draws", "Away wins"], "Matches": counts.values, "Percentage": (counts.values / len(matches) * 100).round(1)}), use_container_width=True, hide_index=True)
 
 st.header("4. Market backtesting")
-st.write("This is a flat-stake historical test. It reports what happened in the selected sample; it is not a forecast or a guarantee of future returns.")
+st.write("Use the date window and odds bounds to test a strategy without cherry-picking only a convenient part of the data.")
+min_date = matches["Date"].min().date()
+max_date = matches["Date"].max().date()
+settings_left, settings_mid, settings_right = st.columns(3)
+with settings_left:
+    start_date = st.date_input("Start date", min_date, min_value=min_date, max_value=max_date)
+with settings_mid:
+    end_date = st.date_input("End date", max_date, min_value=min_date, max_value=max_date)
+with settings_right:
+    max_odds = st.number_input("Maximum odds", min_value=1.01, max_value=20.0, value=10.0, step=0.25)
+
+if start_date > end_date:
+    st.error("Start date must be before end date.")
+    st.stop()
 
 one_x_two_options = [column for column in ["B365H", "AvgH", "MaxH", "BWH", "IWH", "PSH", "WH", "VCH"] if column in matches.columns]
 draw_options = [column for column in ["B365D", "AvgD", "MaxD", "BWD", "IWD", "PSD", "WD", "VCD"] if column in matches.columns]
@@ -179,7 +199,7 @@ away_options = [column for column in ["B365A", "AvgA", "MaxA", "BWA", "IWA", "PS
 over_options = [column for column in ["B365>2.5", "Avg>2.5", "Max>2.5", "P>2.5"] if column in matches.columns]
 under_options = [column for column in ["B365<2.5", "Avg<2.5", "Max<2.5", "P<2.5"] if column in matches.columns]
 
-market_tab, totals_tab = st.tabs(["1X2", "Goals totals"])
+market_tab, totals_tab, comparison_tab = st.tabs(["1X2", "Goals totals", "Threshold comparison"])
 with market_tab:
     market_choice = st.selectbox("1X2 selection", ["Home win", "Draw", "Away win"])
     market_columns = {"Home win": one_x_two_options, "Draw": draw_options, "Away win": away_options}
@@ -187,18 +207,13 @@ with market_tab:
     selected_market_column = st.selectbox("Odds source", market_columns[market_choice]) if market_columns[market_choice] else None
     minimum_odds = st.slider("Minimum odds", 1.01, 5.00, 1.50, 0.05)
     if selected_market_column:
-        summary, tested = run_flat_stake_backtest(matches, selected_market_column, "FTR", outcome_values[market_choice], minimum_odds)
+        summary, tested = backtest(matches, selected_market_column, "FTR", outcome_values[market_choice], minimum_odds, max_odds, start_date, end_date)
         if summary:
-            cols = st.columns(6)
-            cols[0].metric("Bets", summary["Bets"])
-            cols[1].metric("Wins", summary["Wins"])
-            cols[2].metric("Strike rate", f"{summary['Strike rate']:.1f}%")
-            cols[3].metric("Profit", f"{summary['Profit']:+.2f} units")
-            cols[4].metric("ROI", f"{summary['ROI']:+.2f}%")
-            cols[5].metric("Average odds", f"{summary['Average odds']:.2f}")
+            show_summary(summary)
+            st.line_chart(tested.set_index("Date")["CumulativeProfit"])
             st.dataframe(tested.head(100), use_container_width=True, hide_index=True)
         else:
-            st.warning("No qualifying bets were found with that odds column and minimum odds.")
+            st.warning("No qualifying bets were found with those settings.")
     else:
         st.warning("No compatible 1X2 odds columns were found in this dataset.")
 
@@ -210,20 +225,49 @@ with totals_tab:
     if total_column:
         data = matches.copy()
         data["TotalOutcome"] = (data["TotalGoals"] > 2.5) if total_choice == "Over 2.5 goals" else (data["TotalGoals"] < 2.5)
-        summary, tested = run_flat_stake_backtest(data, total_column, "TotalOutcome", True, minimum_total_odds)
+        summary, tested = backtest(data, total_column, "TotalOutcome", True, minimum_total_odds, max_odds, start_date, end_date)
         if summary:
-            cols = st.columns(6)
-            cols[0].metric("Bets", summary["Bets"])
-            cols[1].metric("Wins", summary["Wins"])
-            cols[2].metric("Strike rate", f"{summary['Strike rate']:.1f}%")
-            cols[3].metric("Profit", f"{summary['Profit']:+.2f} units")
-            cols[4].metric("ROI", f"{summary['ROI']:+.2f}%")
-            cols[5].metric("Average odds", f"{summary['Average odds']:.2f}")
+            show_summary(summary)
+            st.line_chart(tested.set_index("Date")["CumulativeProfit"])
             st.dataframe(tested.head(100), use_container_width=True, hide_index=True)
         else:
-            st.warning("No qualifying bets were found with that odds column and minimum odds.")
+            st.warning("No qualifying bets were found with those settings.")
     else:
         st.warning("No compatible over/under 2.5 odds columns were found in this dataset.")
+
+with comparison_tab:
+    st.write("Compare several minimum-odds thresholds over the same date range. This helps reveal whether a result depends on one hand-picked cutoff.")
+    comparison_market = st.selectbox("Comparison market", ["Over 2.5 goals", "Under 2.5 goals", "Home win", "Draw", "Away win"])
+    if comparison_market == "Over 2.5 goals":
+        comparison_columns = over_options
+        comparison_outcome = "TotalOutcome"
+        comparison_value = True
+        comparison_frame = matches.copy()
+        comparison_frame["TotalOutcome"] = comparison_frame["TotalGoals"] > 2.5
+    elif comparison_market == "Under 2.5 goals":
+        comparison_columns = under_options
+        comparison_outcome = "TotalOutcome"
+        comparison_value = True
+        comparison_frame = matches.copy()
+        comparison_frame["TotalOutcome"] = comparison_frame["TotalGoals"] < 2.5
+    else:
+        comparison_columns = {"Home win": one_x_two_options, "Draw": draw_options, "Away win": away_options}[comparison_market]
+        comparison_outcome = "FTR"
+        comparison_value = {"Home win": "H", "Draw": "D", "Away win": "A"}[comparison_market]
+        comparison_frame = matches
+    if comparison_columns:
+        comparison_column = st.selectbox("Comparison odds source", comparison_columns)
+        rows = []
+        for threshold in [1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 3.00]:
+            result, _ = backtest(comparison_frame, comparison_column, comparison_outcome, comparison_value, threshold, max_odds, start_date, end_date)
+            if result:
+                rows.append({"Minimum odds": threshold, "Bets": result["Bets"], "Strike rate %": round(result["Strike rate"], 2), "ROI %": round(result["ROI"], 2), "Profit units": round(result["Profit"], 2), "Max drawdown": round(result["Max drawdown"], 2)})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.warning("No comparison results were available.")
+    else:
+        st.warning("No compatible odds columns were found for this market.")
 
 st.header("5. Team form and performance")
 teams = sorted(pd.unique(matches[["HomeTeam", "AwayTeam"]].values.ravel()))
@@ -261,4 +305,4 @@ if available_stats and len(team_matches):
 else:
     st.info("Upload a dataset containing optional statistics to see team-level averages.")
 
-st.caption("Backtesting is descriptive and sensitive to sample selection, missing odds and bookmaker margin. No future information is used in the current summaries.")
+st.caption("Next: pre-match team-strength features and walk-forward model evaluation. No future information is used in the current summaries.")
