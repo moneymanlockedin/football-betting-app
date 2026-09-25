@@ -3,8 +3,8 @@
 exec(compile(open("app_locked.py", "r", encoding="utf-8").read(), "app_locked.py", "exec"))
 
 from datetime import date, timedelta
-
 import pandas as pd
+import streamlit as st
 
 from live_api import (
     event_rows,
@@ -20,10 +20,70 @@ from live_api import (
     statistics_rows,
 )
 
+
+def _load_prediction_and_odds(fixture_id):
+    prediction_payload, prediction_error = prediction_for_fixture(fixture_id)
+    odds_payload, odds_error = odds_for_fixture(fixture_id)
+    prediction = prediction_summary(prediction_payload) if not prediction_error else None
+    odds = odds_rows(odds_payload) if not odds_error else []
+    st.session_state["selected_prediction_summary"] = prediction
+    st.session_state["selected_fixture_odds"] = odds
+    return prediction, odds, prediction_error, odds_error
+
+
+def _build_suggestions(prediction, odds, edge_threshold, probability_floor):
+    if not prediction or not odds:
+        return []
+    probability_map = {
+        "home": prediction.get("Home probability"),
+        "draw": prediction.get("Draw probability"),
+        "away": prediction.get("Away probability"),
+    }
+    selection_map = {"home": "Home", "draw": "Draw", "away": "Away"}
+    candidates = []
+    for row in odds:
+        market = str(row.get("Market") or "").strip().lower()
+        selection = str(row.get("Selection") or "").strip().lower()
+        if not any(term in market for term in ("match winner", "fulltime result", "1x2", "winner")):
+            continue
+        if selection in {"home", "1"}:
+            key = "home"
+        elif selection in {"draw", "x"}:
+            key = "draw"
+        elif selection in {"away", "2"}:
+            key = "away"
+        else:
+            continue
+        try:
+            model_probability = float(str(probability_map[key]).replace("%", "")) / 100
+            odd = float(row.get("Odd"))
+        except (TypeError, ValueError):
+            continue
+        if odd <= 1 or model_probability < probability_floor / 100:
+            continue
+        implied_probability = 1 / odd
+        edge = model_probability - implied_probability
+        expected_value = model_probability * odd - 1
+        if edge * 100 >= edge_threshold:
+            candidates.append({
+                "Market": row.get("Market"),
+                "Selection": selection_map[key],
+                "Bookmaker": row.get("Bookmaker"),
+                "Odds": round(odd, 3),
+                "Model probability": f"{model_probability * 100:.1f}%",
+                "Implied probability": f"{implied_probability * 100:.1f}%",
+                "Estimated edge": f"{edge * 100:+.1f} pp",
+                "Illustrative expected value": f"{expected_value * 100:+.1f}%",
+                "Status": "Research candidate",
+                "_sort": expected_value,
+            })
+    return sorted(candidates, key=lambda x: x["_sort"], reverse=True)
+
+
 st.header("9. Live fixtures, markets, and current match context")
 st.caption(
-    "Live data comes from API-Football. Odds and markets depend on provider coverage and your API plan. "
-    "Research context is not a guarantee or a betting instruction."
+    "Live data comes from API-Football. Availability depends on the league and API plan. "
+    "All outputs are research context, not guarantees."
 )
 
 live_col, date_col = st.columns(2)
@@ -53,6 +113,8 @@ if st.button("Load fixtures for selected date"):
         st.error(daily_error)
     elif daily_payload:
         st.session_state["api_fixture_payload"] = daily_payload
+        st.session_state.pop("selected_prediction_summary", None)
+        st.session_state.pop("selected_fixture_odds", None)
         st.success(f"Loaded {len(daily_payload)} fixtures.")
     else:
         st.session_state["api_fixture_payload"] = []
@@ -62,7 +124,6 @@ fixture_payload = st.session_state.get("api_fixture_payload", [])
 if fixture_payload:
     st.subheader("Fixtures")
     st.dataframe(fixture_rows(fixture_payload), use_container_width=True, hide_index=True)
-
     fixture_options = {}
     for item in fixture_payload:
         fixture = item.get("fixture", {})
@@ -93,42 +154,33 @@ if fixture_payload:
                 st.error(prediction_error)
             else:
                 summary = prediction_summary(prediction_payload)
+                st.session_state["selected_prediction_summary"] = summary
                 if summary:
-                    st.session_state["selected_prediction_summary"] = summary
                     st.subheader("API prediction context")
                     st.dataframe(pd.DataFrame([summary]), use_container_width=True, hide_index=True)
                 else:
-                    st.session_state["selected_prediction_summary"] = None
                     st.info("No prediction data was available for this fixture.")
 
         if load_odds:
             odds_payload, odds_error = odds_for_fixture(selected_id)
             if odds_error:
                 st.error(odds_error)
-            elif odds_payload:
+            else:
                 parsed_odds = odds_rows(odds_payload)
                 st.session_state["selected_fixture_odds"] = parsed_odds
-                st.subheader("Available markets and bookmaker odds")
                 if parsed_odds:
-                    odds_df = pd.DataFrame(parsed_odds)
-                    st.dataframe(odds_df, use_container_width=True, hide_index=True)
-                    st.caption(
-                        "The table displays available selections across markets such as match result, double chance, goals, "
-                        "BTTS, corners, cards, and player markets when supplied by the provider."
-                    )
+                    st.subheader("Available markets and bookmaker odds")
+                    st.dataframe(pd.DataFrame(parsed_odds), use_container_width=True, hide_index=True)
                 else:
-                    st.info("The provider returned the fixture but no market selections were available.")
-            else:
-                st.info("No odds were returned for this fixture or league.")
+                    st.info("No odds were returned for this fixture or league.")
 
         if load_stats:
             stats_payload, stats_error = statistics_for_fixture(selected_id)
             if stats_error:
                 st.error(stats_error)
             elif stats_payload:
-                rows = statistics_rows(stats_payload)
                 st.subheader("Fixture statistics")
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(statistics_rows(stats_payload)), use_container_width=True, hide_index=True)
             else:
                 st.info("No statistics were available for this fixture yet.")
 
@@ -142,13 +194,9 @@ if fixture_payload:
             else:
                 st.info("No events were returned for this fixture yet.")
 
-        st.subheader("Research market watchlist")
-        st.write(
-            "This section surfaces available market prices for inspection. A market is not labelled as a value bet unless "
-            "the app has a calibrated, market-specific probability model and an out-of-sample test for it."
-        )
         stored_odds = st.session_state.get("selected_fixture_odds", [])
         if stored_odds:
+            st.subheader("Research market watchlist")
             watch_df = pd.DataFrame(stored_odds).copy()
             watch_df["Decimal odd"] = pd.to_numeric(watch_df["Odd"], errors="coerce")
             watch_df["Implied probability %"] = (100 / watch_df["Decimal odd"]).round(2)
@@ -159,92 +207,40 @@ if fixture_payload:
                 sorted(watch_df["Market"].dropna().unique().tolist()),
                 default=sorted(watch_df["Market"].dropna().unique().tolist())[:8],
             )
-            if market_filter:
-                view = watch_df[watch_df["Market"].isin(market_filter)].copy()
-            else:
-                view = watch_df.iloc[0:0]
+            view = watch_df[watch_df["Market"].isin(market_filter)] if market_filter else watch_df.iloc[0:0]
             st.dataframe(view, use_container_width=True, hide_index=True)
-            st.info(
-                "Implied probability is calculated from the displayed decimal price only and does not remove bookmaker margin. "
-                "It is not the model probability."
-            )
-        else:
-            st.info("Load all odds above to populate the market watchlist.")
+            st.info("Implied probability is based on the displayed odds and does not remove bookmaker margin.")
 
         st.header("10. Suggested bets research shortlist")
         st.caption(
-            "This shortlist compares API prediction probabilities with available 1X2 prices. It is a research filter, "
-            "not a guarantee, and it does not yet claim calibrated probabilities for every market such as corners, cards or passes."
+            "Use the one-click generator below. It loads both prediction data and odds automatically, then compares API-supplied 1X2 probabilities with available prices."
         )
-        edge_threshold = st.slider("Minimum estimated edge (percentage points)", 0.0, 20.0, 3.0, 0.5)
-        probability_floor = st.slider("Minimum model probability (%)", 0, 90, 45, 5)
-        prediction = st.session_state.get("selected_prediction_summary")
-        suggestion_rows = []
-        if prediction and stored_odds:
-            probability_map = {
-                "home": prediction.get("Home probability"),
-                "draw": prediction.get("Draw probability"),
-                "away": prediction.get("Away probability"),
-            }
-            selection_map = {
-                "home": "Home",
-                "draw": "Draw",
-                "away": "Away",
-            }
-            for row in stored_odds:
-                market = str(row.get("Market") or "").lower()
-                selection = str(row.get("Selection") or "").strip().lower()
-                if not any(term in market for term in ["match winner", "fulltime result", "1x2", "winner"]):
-                    continue
-                if selection in {"home", "1"}:
-                    key = "home"
-                elif selection in {"draw", "x"}:
-                    key = "draw"
-                elif selection in {"away", "2"}:
-                    key = "away"
+        edge_threshold = st.slider("Minimum estimated edge (percentage points)", 0.0, 20.0, 3.0, 0.5, key="suggest_edge")
+        probability_floor = st.slider("Minimum model probability (%)", 0, 90, 45, 5, key="suggest_probability")
+        generate = st.button("Generate suggested bets", type="primary")
+        if generate:
+            with st.spinner("Loading prediction and odds, then analysing available 1X2 prices..."):
+                prediction, fresh_odds, prediction_error, odds_error = _load_prediction_and_odds(selected_id)
+            if prediction_error:
+                st.error(f"Prediction request: {prediction_error}")
+            if odds_error:
+                st.error(f"Odds request: {odds_error}")
+            if not prediction:
+                st.warning("No usable prediction was returned for this fixture.")
+            elif not fresh_odds:
+                st.warning("No usable odds were returned for this fixture or league.")
+            else:
+                candidates = _build_suggestions(prediction, fresh_odds, edge_threshold, probability_floor)
+                if candidates:
+                    result = pd.DataFrame(candidates).drop(columns=["_sort"])
+                    st.success(f"{len(result)} research candidate(s) passed your filters.")
+                    st.dataframe(result, use_container_width=True, hide_index=True)
                 else:
-                    continue
-                raw_probability = probability_map.get(key)
-                if raw_probability is None:
-                    continue
-                try:
-                    model_probability = float(str(raw_probability).replace("%", "")) / 100
-                    odd = float(row.get("Odd"))
-                except (TypeError, ValueError):
-                    continue
-                if odd <= 1 or model_probability < probability_floor / 100:
-                    continue
-                implied_probability = 1 / odd
-                edge = model_probability - implied_probability
-                expected_value = model_probability * odd - 1
-                if edge * 100 >= edge_threshold:
-                    suggestion_rows.append(
-                        {
-                            "Market": row.get("Market"),
-                            "Selection": selection_map[key],
-                            "Bookmaker": row.get("Bookmaker"),
-                            "Odds": round(odd, 3),
-                            "API model probability": f"{model_probability * 100:.1f}%",
-                            "Implied probability": f"{implied_probability * 100:.1f}%",
-                            "Estimated edge": f"{edge * 100:+.1f} pp",
-                            "Illustrative expected value": f"{expected_value * 100:+.1f}%",
-                        }
-                    )
-        if suggestion_rows:
-            suggestions_df = pd.DataFrame(suggestion_rows)
-            suggestions_df["_sort"] = suggestions_df["Illustrative expected value"].str.replace("%", "", regex=False).astype(float)
-            suggestions_df = suggestions_df.sort_values("_sort", ascending=False).drop(columns=["_sort"])
-            st.success(f"{len(suggestions_df)} research candidate(s) passed your filters.")
-            st.dataframe(suggestions_df, use_container_width=True, hide_index=True)
-        elif not prediction:
-            st.info("Load prediction first, then load all odds, to generate the shortlist.")
-        elif not stored_odds:
-            st.info("Load all odds first, then load prediction, to generate the shortlist.")
+                    st.info("No 1X2 candidate passed these filters. PASS for this fixture under the selected settings.")
         else:
-            st.info("No 1X2 candidate passed the selected filters. That means PASS for this fixture under these settings.")
+            st.info("Click Generate suggested bets. You no longer need to load prediction and odds separately.")
         st.warning(
-            "The shortlist currently uses API-Football's supplied 1X2 probabilities and displayed odds. "
-            "It is not yet a validated multi-market model using your historical statistics, and it should not be treated as a standalone betting rule."
+            "This version is an API-based 1X2 research filter, not a validated all-market model. It does not claim calibrated predictions for corners, cards, passes or player markets."
         )
 
 st.caption("API responses are cached briefly to reduce unnecessary requests. Refresh the relevant section when you need updated data.")
