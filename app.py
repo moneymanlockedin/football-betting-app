@@ -94,9 +94,11 @@ if fixture_payload:
             else:
                 summary = prediction_summary(prediction_payload)
                 if summary:
+                    st.session_state["selected_prediction_summary"] = summary
                     st.subheader("API prediction context")
                     st.dataframe(pd.DataFrame([summary]), use_container_width=True, hide_index=True)
                 else:
+                    st.session_state["selected_prediction_summary"] = None
                     st.info("No prediction data was available for this fixture.")
 
         if load_odds:
@@ -168,5 +170,81 @@ if fixture_payload:
             )
         else:
             st.info("Load all odds above to populate the market watchlist.")
+
+        st.header("10. Suggested bets research shortlist")
+        st.caption(
+            "This shortlist compares API prediction probabilities with available 1X2 prices. It is a research filter, "
+            "not a guarantee, and it does not yet claim calibrated probabilities for every market such as corners, cards or passes."
+        )
+        edge_threshold = st.slider("Minimum estimated edge (percentage points)", 0.0, 20.0, 3.0, 0.5)
+        probability_floor = st.slider("Minimum model probability (%)", 0, 90, 45, 5)
+        prediction = st.session_state.get("selected_prediction_summary")
+        suggestion_rows = []
+        if prediction and stored_odds:
+            probability_map = {
+                "home": prediction.get("Home probability"),
+                "draw": prediction.get("Draw probability"),
+                "away": prediction.get("Away probability"),
+            }
+            selection_map = {
+                "home": "Home",
+                "draw": "Draw",
+                "away": "Away",
+            }
+            for row in stored_odds:
+                market = str(row.get("Market") or "").lower()
+                selection = str(row.get("Selection") or "").strip().lower()
+                if not any(term in market for term in ["match winner", "fulltime result", "1x2", "winner"]):
+                    continue
+                if selection in {"home", "1"}:
+                    key = "home"
+                elif selection in {"draw", "x"}:
+                    key = "draw"
+                elif selection in {"away", "2"}:
+                    key = "away"
+                else:
+                    continue
+                raw_probability = probability_map.get(key)
+                if raw_probability is None:
+                    continue
+                try:
+                    model_probability = float(str(raw_probability).replace("%", "")) / 100
+                    odd = float(row.get("Odd"))
+                except (TypeError, ValueError):
+                    continue
+                if odd <= 1 or model_probability < probability_floor / 100:
+                    continue
+                implied_probability = 1 / odd
+                edge = model_probability - implied_probability
+                expected_value = model_probability * odd - 1
+                if edge * 100 >= edge_threshold:
+                    suggestion_rows.append(
+                        {
+                            "Market": row.get("Market"),
+                            "Selection": selection_map[key],
+                            "Bookmaker": row.get("Bookmaker"),
+                            "Odds": round(odd, 3),
+                            "API model probability": f"{model_probability * 100:.1f}%",
+                            "Implied probability": f"{implied_probability * 100:.1f}%",
+                            "Estimated edge": f"{edge * 100:+.1f} pp",
+                            "Illustrative expected value": f"{expected_value * 100:+.1f}%",
+                        }
+                    )
+        if suggestion_rows:
+            suggestions_df = pd.DataFrame(suggestion_rows)
+            suggestions_df["_sort"] = suggestions_df["Illustrative expected value"].str.replace("%", "", regex=False).astype(float)
+            suggestions_df = suggestions_df.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+            st.success(f"{len(suggestions_df)} research candidate(s) passed your filters.")
+            st.dataframe(suggestions_df, use_container_width=True, hide_index=True)
+        elif not prediction:
+            st.info("Load prediction first, then load all odds, to generate the shortlist.")
+        elif not stored_odds:
+            st.info("Load all odds first, then load prediction, to generate the shortlist.")
+        else:
+            st.info("No 1X2 candidate passed the selected filters. That means PASS for this fixture under these settings.")
+        st.warning(
+            "The shortlist currently uses API-Football's supplied 1X2 probabilities and displayed odds. "
+            "It is not yet a validated multi-market model using your historical statistics, and it should not be treated as a standalone betting rule."
+        )
 
 st.caption("API responses are cached briefly to reduce unnecessary requests. Refresh the relevant section when you need updated data.")
